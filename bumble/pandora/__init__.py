@@ -79,9 +79,6 @@ async def serve(
             add_SecurityStorageServicer_to_server(
                 SecurityStorageService(bumble.device, config), server
             )
-            add_SecurityStorageServicer_to_server(
-                SecurityStorageService(bumble.device, config), server
-            )
             add_L2CAPServicer_to_server(L2CAPService(bumble.device, config), server)
 
             # call hooks if any.

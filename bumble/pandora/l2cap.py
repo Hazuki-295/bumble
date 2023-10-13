@@ -14,10 +14,9 @@
 
 import abc
 import asyncio
-import collections
 import dataclasses
-import grpc
 import logging
+import grpc
 import struct
 
 from bumble import device
@@ -29,120 +28,144 @@ from google.protobuf import any_pb2  # pytype: disable=pyi-error
 from google.protobuf import empty_pb2  # pytype: disable=pyi-error
 from pandora import l2cap_pb2
 from pandora import l2cap_grpc_aio
-from typing import AsyncGenerator, Dict, Union, Optional, DefaultDict
+from typing import Any, AsyncGenerator, AsyncIterator, Dict, List, Union
 
 
 class ChannelProxy(abc.ABC):
-    up_queue: asyncio.Queue[bytes] = asyncio.Queue()
-
-    def send(self, sdu: bytes) -> None:
-        ...
+    rx: asyncio.Queue[bytes] = asyncio.Queue()
 
     async def receive(self) -> bytes:
-        return await self.up_queue.get()
-
-    def on_data(self, pdu: bytes) -> None:
-        self.up_queue.put_nowait(pdu)
-
-
-class CocChannelProxy(ChannelProxy):
-    def __init__(
-        self, channel: Union[l2cap.ClassicChannel, l2cap.LeCreditBasedChannel]
-    ) -> None:
-        super().__init__()
-        self.channel = channel
-        channel.sink = self.on_data
-        self.disconnection_result = asyncio.get_event_loop().create_future()
-
-        @channel.once('close')
-        def on_close() -> None:
-            self.disconnection_result.set_result(None)
+        return await self.rx.get()
 
     def send(self, data: bytes) -> None:
+        ...
+
+    async def disconnect(self) -> None:
+        ...
+
+    async def wait_disconnect(self) -> None:
+        ...
+
+
+@dataclasses.dataclass
+class DynamicChannelProxy(ChannelProxy):
+    channel: Union[l2cap.ClassicChannel, l2cap.LeCreditBasedChannel, None]
+
+    def __post_init__(self) -> None:
+        assert self.channel
+        self.disconnection_result = asyncio.get_event_loop().create_future()
+        self.channel.sink = self.rx.put_nowait
+
+        def on_close() -> None:
+            assert not self.disconnection_result.done()
+            self.channel = None
+            self.disconnection_result.set_result(None)
+
+        self.channel.on('close', on_close)
+
+    def send(self, data: bytes) -> None:
+        assert self.channel
         if isinstance(self.channel, l2cap.ClassicChannel):
             self.channel.send_pdu(data)
         else:
             self.channel.write(data)
 
-    @property
-    def closed(self):
-        if isinstance(self.channel, l2cap.ClassicChannel):
-            return self.channel.state == self.channel.State.CLOSED
-        else:
-            return self.channel.state == self.channel.State.DISCONNECTED
-
     async def disconnect(self) -> None:
-        if self.closed:
-            return
-
+        assert self.channel
         await self.channel.disconnect()
 
     async def wait_disconnect(self) -> None:
-        if self.closed:
-            return
-
-        await self.disconnection_result
+        return await self.disconnection_result
 
 
 @dataclasses.dataclass
 class FixedChannelProxy(ChannelProxy):
-    connection_handle: int
+    connection: device.Connection
     cid: int
-    device: device.Device
 
     def send(self, data: bytes) -> None:
-        self.device.send_l2cap_pdu(self.connection_handle, self.cid, data)
+        self.connection.device.send_l2cap_pdu(self.connection.handle, self.cid, data)
 
+    async def disconnect(self) -> None:
+        raise RuntimeError('Fixed channel cannot be disconnected')
+
+    async def wait_disconnect(self) -> None:
+        raise RuntimeError('Fixed channel cannot be disconnected')
+
+
+@dataclasses.dataclass
+class ChannelIndex:
+    connection_handle: int
+    cid: int
+
+    @classmethod
+    def from_token(cls, token: l2cap_pb2.Channel) -> 'ChannelIndex':
+        connection_handle, cid = struct.unpack('>HH', token.cookie.value)
+        return cls(connection_handle, cid)
+
+    def into_token(self) -> l2cap_pb2.Channel:
+        return l2cap_pb2.Channel(
+            cookie=any_pb2.Any(
+                value=struct.pack('>HH', self.connection_handle, self.cid)
+            )
+        )
+
+    def __hash__(self):
+        return hash(self.connection_handle | (self.cid << 12))
 
 class L2CAPService(l2cap_grpc_aio.L2CAPServicer):
-    channels: DefaultDict[int, Dict[int, ChannelProxy]]
+    channels: Dict[ChannelIndex, ChannelProxy] = {}
+    pending: List[l2cap.IncomingConnection.Any] = []
+    accepts: List[asyncio.Queue[l2cap.IncomingConnection.Any]] = []
 
-    def __init__(self, device: device.Device, config: config.Config) -> None:
-        self.log = utils.BumbleServerLoggerAdapter(
-            logging.getLogger(), {'service_name': 'L2CAP', 'device': device}
-        )
-        self.device = device
+    def __init__(self, dev: device.Device, config: config.Config) -> None:
+        self.device = dev
         self.config = config
-        self.channels = collections.defaultdict(dict)
 
-    def get_channel(self, channel: l2cap_pb2.Channel) -> ChannelProxy:
-        connection_handle, cid = struct.unpack('>HH', channel.cookie.value)
-        if cid not in self.channels[connection_handle]:
-            raise RuntimeError('No valid cid or handle')
-        return self.channels[connection_handle][cid]
+        @self.device.l2cap_channel_manager.listen
+        def _(incoming: l2cap.IncomingConnection.Any) -> None:
+            self.pending.append(incoming)
+            for acceptor in self.accepts:
+                acceptor.put_nowait(incoming)
+
+    def register(self, index: ChannelIndex, proxy: ChannelProxy) -> None:
+        self.channels[index] = proxy
+
+        def on_close(*_: Any) -> None:
+            # TODO: Fix Bumble L2CAP emit `close` twice.
+            if index in self.channels:
+                del self.channels[index]
+
+        # Listen for disconnection.
+        if isinstance(proxy, FixedChannelProxy):
+            proxy.connection.on('disconnection', on_close)
+        elif isinstance(proxy, DynamicChannelProxy):
+            assert proxy.channel
+            proxy.channel.on('close', on_close)
+
+    async def listen(self) -> AsyncIterator[l2cap.IncomingConnection.Any]:
+        for incoming in self.pending:
+            if incoming.expired():
+                self.pending.remove(incoming)
+                continue
+            yield incoming
+        queue = asyncio.Queue()
+        self.accepts.append(queue)
+        try:
+            while incoming := await queue.get():
+                yield incoming
+        finally:
+            self.accepts.remove(queue)
 
     @utils.rpc
     async def Connect(
         self, request: l2cap_pb2.ConnectRequest, context: grpc.ServicerContext
     ) -> l2cap_pb2.ConnectResponse:
-        self.log.info('Connect')
-        channel: Union[
-            FixedChannelProxy, l2cap.ClassicChannel, l2cap.LeCreditBasedChannel
-        ]
+        # Retrieve Bumble `Connection` from request.
         connection_handle = int.from_bytes(request.connection.cookie.value, 'big')
-
         connection = self.device.lookup_connection(connection_handle)
         if connection is None:
-            raise RuntimeError('Connection not exist')
-
-        if request.type_variant() == 'fixed':
-            # For fixed channel connection, do nothing because it's connectionless
-            assert request.fixed
-            cid = request.fixed.cid
-            l2cap_cookie = any_pb2.Any(value=struct.pack('>HH', connection_handle, cid))
-            self.channels[connection_handle][cid] = FixedChannelProxy(
-                connection_handle=connection_handle,
-                cid=cid,
-                device=self.device,
-            )
-
-            def on_fixed_pdu(connection_handle: int, pdu: bytes) -> None:
-                self.channels[connection_handle][cid].on_data(pdu)
-
-            self.device.l2cap_channel_manager.register_fixed_channel(cid, on_fixed_pdu)
-            return l2cap_pb2.ConnectResponse(
-                channel=l2cap_pb2.Channel(cookie=l2cap_cookie)
-            )
+            raise RuntimeError(f'{connection_handle}: not connection for handle')
 
         if request.type_variant() == 'basic':
             assert request.basic
@@ -162,126 +185,72 @@ class L2CAPService(l2cap_grpc_aio.L2CAPServicer):
                 )
             )
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"{request.type_variant()}: unsupported type")
 
-        self.channels[connection_handle][channel.source_cid] = CocChannelProxy(channel)
-        l2cap_cookie = any_pb2.Any(
-            value=struct.pack('>HH', connection_handle, channel.source_cid)
-        )
-        return l2cap_pb2.ConnectResponse(channel=l2cap_pb2.Channel(cookie=l2cap_cookie))
+        index = ChannelIndex(channel.connection.handle, channel.source_cid)
+        self.register(index, DynamicChannelProxy(channel))
+        return l2cap_pb2.ConnectResponse(channel=index.into_token())
 
     @utils.rpc
-    async def OnConnection(
-        self, request: l2cap_pb2.OnConnectionRequest, context: grpc.ServicerContext
-    ) -> AsyncGenerator[l2cap_pb2.OnConnectionResponse, None]:
-        self.log.info('WaitConnection')
+    async def WaitConnection(
+        self, request: l2cap_pb2.WaitConnectionRequest, context: grpc.ServicerContext
+    ) -> l2cap_pb2.WaitConnectionResponse:
+        iter = self.listen()
+        fut: asyncio.Future[
+            Union[l2cap.ClassicChannel, l2cap.LeCreditBasedChannel]
+        ] = asyncio.Future()
 
-        queue: asyncio.Queue[l2cap_pb2.OnConnectionResponse] = asyncio.Queue()
-        connection_handle = int.from_bytes(request.connection.cookie.value, 'big')
+        # Filter by connection.
+        if request.connection:
+            handle = int.from_bytes(request.connection.cookie.value, 'big')
+            iter = (it async for it in iter if it.connection.handle == handle)
 
-        connection = self.device.lookup_connection(connection_handle)
-        if connection is None:
-            raise RuntimeError('Connection not exist')
-
-        self.channels.setdefault(connection_handle, {})
-
-        watcher = EventWatcher()
-        server: Union[
-            l2cap.ClassicChannelServer, l2cap.LeCreditBasedChannelServer, None
-        ] = None
-        fixed_cid: Optional[int] = None
-
-        # Fixed channels are connectionless, so it should produce a response immediately.
-        if request.type_variant() == 'fixed':
-            assert request.fixed
-            cid = request.fixed.cid
-
-            def on_fixed_pdu(connection_handle: int, pdu: bytes) -> None:
-                self.channels[connection_handle][cid].on_data(pdu)
-
-            channel_proxy = FixedChannelProxy(
-                connection_handle=connection_handle, cid=cid, device=self.device
-            )
-            self.channels[connection_handle][cid] = channel_proxy
-            l2cap_cookie = any_pb2.Any(value=struct.pack('>HH', connection_handle, cid))
-
-            # Register CID and callback
-            self.device.l2cap_channel_manager.register_fixed_channel(cid, on_fixed_pdu)
-
-            queue.put_nowait(
-                l2cap_pb2.OnConnectionResponse(
-                    channel=l2cap_pb2.Channel(cookie=l2cap_cookie)
+        if request.type_variant() == 'basic':
+            assert request.basic
+            async for it in (
+                it
+                async for it in iter
+                if isinstance(it, l2cap.IncomingConnection.Basic)
+                and it.psm == request.basic.psm
+            ):
+                pend = l2cap.PendingConnection.Basic(
+                    fut.set_result,
+                    request.basic.mtu or l2cap.L2CAP_MIN_BR_EDR_MTU,
                 )
-            )
+                if it.accept(pend):
+                    break
+        elif request.type_variant() == 'le_credit_based':
+            assert request.le_credit_based
+            async for it in (
+                it
+                async for it in iter
+                if isinstance(it, l2cap.IncomingConnection.LeCreditBased)
+                and it.psm == request.le_credit_based.spsm
+            ):
+                pend = l2cap.PendingConnection.LeCreditBased(
+                    fut.set_result,
+                    request.le_credit_based.mtu
+                    or l2cap.L2CAP_LE_CREDIT_BASED_CONNECTION_DEFAULT_MTU,
+                    request.le_credit_based.mps
+                    or l2cap.L2CAP_LE_CREDIT_BASED_CONNECTION_DEFAULT_MPS,
+                    request.le_credit_based.initial_credit
+                    or l2cap.L2CAP_LE_CREDIT_BASED_CONNECTION_DEFAULT_INITIAL_CREDITS,
+                )
+                if it.accept(pend):
+                    break
         else:
+            raise NotImplementedError(f"{request.type_variant()}: unsupported type")
 
-            def on_connected(
-                channel: Union[l2cap.ClassicChannel, l2cap.LeCreditBasedChannel]
-            ) -> None:
-                handle = channel.connection.handle
-                # Filter channels from non-specified connection
-                if handle != connection_handle:
-                    connection.abort_on('disconnect', channel.disconnect())
-                    return
-
-                # Save channel instances
-                cid = channel.source_cid
-                self.channels[handle][cid] = CocChannelProxy(channel)
-
-                # Produce connection responses
-                l2cap_cookie = any_pb2.Any(value=struct.pack('>HH', handle, cid))
-                queue.put_nowait(
-                    l2cap_pb2.OnConnectionResponse(
-                        channel=l2cap_pb2.Channel(cookie=l2cap_cookie)
-                    )
-                )
-
-                # Listen disconnections
-                @watcher.on(channel, 'close')
-                def on_close():
-                    del self.channels[handle][cid]
-
-            if request.type_variant() == 'basic':
-                assert request.basic
-                server = self.device.create_l2cap_server(
-                    spec=l2cap.ClassicChannelSpec(psm=request.basic.psm),
-                    handler=on_connected,
-                )
-            elif request.type_variant() == 'le_credit_based':
-                assert request.le_credit_based
-                server = self.device.create_l2cap_server(
-                    spec=l2cap.LeCreditBasedChannelSpec(
-                        psm=request.le_credit_based.spsm,
-                        max_credits=request.le_credit_based.initial_credit,
-                        mtu=request.le_credit_based.mtu,
-                        mps=request.le_credit_based.mps,
-                    ),
-                    handler=on_connected,
-                )
-            else:
-                raise NotImplementedError
-
-        try:
-            # Produce event stream
-            while event := await queue.get():
-                yield event
-        finally:
-            watcher.close()
-            if server:
-                server.close()
-            if fixed_cid:
-                self.device.l2cap_channel_manager.deregister_fixed_channel(fixed_cid)
+        channel = await fut
+        index = ChannelIndex(channel.connection.handle, channel.source_cid)
+        self.register(index, DynamicChannelProxy(channel))
+        return l2cap_pb2.WaitConnectionResponse(channel=index.into_token())
 
     @utils.rpc
     async def Disconnect(
         self, request: l2cap_pb2.DisconnectRequest, context: grpc.ServicerContext
     ) -> l2cap_pb2.DisconnectResponse:
-        self.log.info('Disconnect')
-        channel = self.get_channel(request.channel)
-        if isinstance(channel, FixedChannelProxy):
-            raise ValueError('Fixed channel cannot be disconnected')
-
-        assert isinstance(channel, CocChannelProxy)
+        channel = self.channels[ChannelIndex.from_token(request.channel)]
         await channel.disconnect()
         return l2cap_pb2.DisconnectResponse(success=empty_pb2.Empty())
 
@@ -289,12 +258,7 @@ class L2CAPService(l2cap_grpc_aio.L2CAPServicer):
     async def WaitDisconnection(
         self, request: l2cap_pb2.WaitDisconnectionRequest, context: grpc.ServicerContext
     ) -> l2cap_pb2.WaitDisconnectionResponse:
-        self.log.info('WaitDisconnection')
-        channel = self.get_channel(request.channel)
-        if isinstance(channel, FixedChannelProxy):
-            raise RuntimeError('Fixed channel cannot be disconnected')
-
-        assert isinstance(channel, CocChannelProxy)
+        channel = self.channels[ChannelIndex.from_token(request.channel)]
         await channel.wait_disconnect()
         return l2cap_pb2.WaitDisconnectionResponse(success=empty_pb2.Empty())
 
@@ -302,9 +266,8 @@ class L2CAPService(l2cap_grpc_aio.L2CAPServicer):
     async def Receive(
         self, request: l2cap_pb2.ReceiveRequest, context: grpc.ServicerContext
     ) -> AsyncGenerator[l2cap_pb2.ReceiveResponse, None]:
-        self.log.info('Receive')
-        channel = self.get_channel(request.channel)
-
+        # TODO: fixed channel `Receive`
+        channel = self.channels[ChannelIndex.from_token(request.channel)]
         while packet := await channel.receive():
             yield l2cap_pb2.ReceiveResponse(data=packet)
 
@@ -312,7 +275,7 @@ class L2CAPService(l2cap_grpc_aio.L2CAPServicer):
     async def Send(
         self, request: l2cap_pb2.SendRequest, context: grpc.ServicerContext
     ) -> l2cap_pb2.SendResponse:
-        self.log.info('Send')
-        channel = self.get_channel(request.channel)
+        # TODO: fixed channel `Send`
+        channel = self.channels[ChannelIndex.from_token(request.channel)]
         channel.send(request.data)
         return l2cap_pb2.SendResponse(success=empty_pb2.Empty())
