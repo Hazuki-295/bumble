@@ -17,6 +17,7 @@
 # -----------------------------------------------------------------------------
 from __future__ import annotations
 import asyncio
+import contextlib
 import dataclasses
 import enum
 import logging
@@ -25,6 +26,7 @@ import struct
 from collections import deque
 from pyee import EventEmitter
 from typing import (
+    Awaitable,
     Dict,
     Type,
     List,
@@ -237,6 +239,8 @@ class L2CAP_Control_Frame:
     classes: Dict[int, Type[L2CAP_Control_Frame]] = {}
     code = 0
     name: str
+    identifier: int
+    pdu: bytes
 
     @staticmethod
     def from_bytes(pdu: bytes) -> L2CAP_Control_Frame:
@@ -390,6 +394,9 @@ class L2CAP_Connection_Request(L2CAP_Control_Frame):
     '''
     See Bluetooth spec @ Vol 3, Part A - 4.2 CONNECTION REQUEST
     '''
+
+    psm: int
+    source_cid: int
 
     @staticmethod
     def parse_psm(data: bytes, offset: int = 0) -> Tuple[int, int]:
@@ -637,7 +644,11 @@ class L2CAP_LE_Credit_Based_Connection_Request(L2CAP_Control_Frame):
     (CODE 0x14)
     '''
 
+    le_psm: int
     source_cid: int
+    mtu: int
+    mps: int
+    initial_credits: int
 
 
 # -----------------------------------------------------------------------------
@@ -1433,9 +1444,18 @@ class ChannelManager:
     identifiers: Dict[int, int]
     channels: Dict[int, Dict[int, Union[ClassicChannel, LeCreditBasedChannel]]]
     servers: Dict[int, ClassicChannelServer]
+    server_fallback: Optional[
+        Callable[[L2CAP_Connection_Request], Awaitable[ClassicChannelServer]]
+    ]
     le_coc_channels: Dict[int, Dict[int, LeCreditBasedChannel]]
     le_coc_servers: Dict[int, LeCreditBasedChannelServer]
     le_coc_requests: Dict[int, L2CAP_LE_Credit_Based_Connection_Request]
+    le_coc_server_fallback: Optional[
+        Callable[
+            [L2CAP_LE_Credit_Based_Connection_Request],
+            Awaitable[LeCreditBasedChannelServer],
+        ]
+    ]
     fixed_channels: Dict[int, Optional[Callable[[int, bytes], Any]]]
     _host: Optional[Host]
     connection_parameters_update_response: Optional[asyncio.Future[int]]
@@ -1453,11 +1473,13 @@ class ChannelManager:
             L2CAP_LE_SIGNALING_CID: None,
         }
         self.servers = {}  # Servers accepting connections, by PSM
+        self.server_fallback = None
         self.le_coc_channels = (
             {}
         )  # LE CoC channels, mapped by connection and destination cid
         self.le_coc_servers = {}  # LE CoC - Servers accepting connections, by PSM
         self.le_coc_requests = {}  # LE CoC connection requests, by identifier
+        self.le_coc_server_fallback = None
         self.extended_features = extended_features
         self.connectionless_mtu = connectionless_mtu
         self.connection_parameters_update_response = None
@@ -1719,15 +1741,55 @@ class ChannelManager:
         logger.warning(f'{color("!!! Command rejected:", "red")} {packet.reason}')
 
     def on_l2cap_connection_request(
-        self, connection: Connection, cid: int, request
+        self, connection: Connection, cid: int, request: L2CAP_Connection_Request
     ) -> None:
-        # Check if there's a server for this PSM
-        server = self.servers.get(request.psm)
-        if server:
-            # Find a free CID for this new channel
-            connection_channels = self.channels.setdefault(connection.handle, {})
-            source_cid = self.find_free_br_edr_cid(connection_channels)
-            if source_cid is None:  # Should never happen!
+
+        # Asynchronous connection request handling.
+        async def handle_connection_request() -> None:
+            # Check if there's a server for this PSM
+            server = self.servers.get(request.psm)
+
+            # Attempt to get a fallback server within a timeout.
+            if server is None and self.server_fallback is not None:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    server = await asyncio.wait_for(self.server_fallback(request), 3.0)
+
+            if server:
+                # Find a free CID for this new channel
+                connection_channels = self.channels.setdefault(connection.handle, {})
+                source_cid = self.find_free_br_edr_cid(connection_channels)
+                if source_cid is None:  # Should never happen!
+                    self.send_control_frame(
+                        connection,
+                        cid,
+                        L2CAP_Connection_Response(
+                            identifier=request.identifier,
+                            destination_cid=request.source_cid,
+                            source_cid=0,
+                            # pylint: disable=line-too-long
+                            result=L2CAP_Connection_Response.CONNECTION_REFUSED_NO_RESOURCES_AVAILABLE,
+                            status=0x0000,
+                        ),
+                    )
+                    return
+
+                # Create a new channel
+                logger.debug(
+                    f'creating server channel with cid={source_cid} for psm {request.psm}'
+                )
+                channel = ClassicChannel(
+                    self, connection, cid, request.psm, source_cid, server.mtu
+                )
+                connection_channels[source_cid] = channel
+
+                # Notify
+                server.on_connection(channel)
+                channel.on_connection_request(request)
+            else:
+                logger.warning(
+                    f'No server for connection 0x{connection.handle:04X} '
+                    f'on PSM {request.psm}'
+                )
                 self.send_control_frame(
                     connection,
                     cid,
@@ -1736,41 +1798,13 @@ class ChannelManager:
                         destination_cid=request.source_cid,
                         source_cid=0,
                         # pylint: disable=line-too-long
-                        result=L2CAP_Connection_Response.CONNECTION_REFUSED_NO_RESOURCES_AVAILABLE,
+                        result=L2CAP_Connection_Response.CONNECTION_REFUSED_PSM_NOT_SUPPORTED,
                         status=0x0000,
                     ),
                 )
-                return
 
-            # Create a new channel
-            logger.debug(
-                f'creating server channel with cid={source_cid} for psm {request.psm}'
-            )
-            channel = ClassicChannel(
-                self, connection, cid, request.psm, source_cid, server.mtu
-            )
-            connection_channels[source_cid] = channel
-
-            # Notify
-            server.on_connection(channel)
-            channel.on_connection_request(request)
-        else:
-            logger.warning(
-                f'No server for connection 0x{connection.handle:04X} '
-                f'on PSM {request.psm}'
-            )
-            self.send_control_frame(
-                connection,
-                cid,
-                L2CAP_Connection_Response(
-                    identifier=request.identifier,
-                    destination_cid=request.source_cid,
-                    source_cid=0,
-                    # pylint: disable=line-too-long
-                    result=L2CAP_Connection_Response.CONNECTION_REFUSED_PSM_NOT_SUPPORTED,
-                    status=0x0000,
-                ),
-            )
+        # Spawn connection request handling.
+        connection.abort_on('disconnection', handle_connection_request())
 
     def on_l2cap_connection_response(
         self, connection: Connection, cid: int, response
@@ -1971,108 +2005,125 @@ class ChannelManager:
             )
 
     def on_l2cap_le_credit_based_connection_request(
-        self, connection: Connection, cid: int, request
+        self,
+        connection: Connection,
+        cid: int,
+        request: L2CAP_LE_Credit_Based_Connection_Request,
     ) -> None:
-        if request.le_psm in self.le_coc_servers:
-            server = self.le_coc_servers[request.le_psm]
 
-            # Check that the CID isn't already used
-            le_connection_channels = self.le_coc_channels.setdefault(
-                connection.handle, {}
-            )
-            if request.source_cid in le_connection_channels:
-                logger.warning(f'source CID {request.source_cid} already in use')
+        # Asynchronous connection request handling.
+        async def handle_connection_request() -> None:
+            # Check if there's a server for this LE PSM
+            server = self.servers.get(request.le_psm)
+
+            # Attempt to get a fallback server within a timeout.
+            if server is None and self.le_coc_server_fallback is not None:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    server = await asyncio.wait_for(
+                        self.le_coc_server_fallback(request), 3.0
+                    )
+
+            if server:
+                # Check that the CID isn't already used
+                le_connection_channels = self.le_coc_channels.setdefault(
+                    connection.handle, {}
+                )
+                if request.source_cid in le_connection_channels:
+                    logger.warning(f'source CID {request.source_cid} already in use')
+                    self.send_control_frame(
+                        connection,
+                        cid,
+                        L2CAP_LE_Credit_Based_Connection_Response(
+                            identifier=request.identifier,
+                            destination_cid=0,
+                            mtu=server.mtu,
+                            mps=server.mps,
+                            initial_credits=0,
+                            # pylint: disable=line-too-long
+                            result=L2CAP_LE_Credit_Based_Connection_Response.CONNECTION_REFUSED_SOURCE_CID_ALREADY_ALLOCATED,
+                        ),
+                    )
+                    return
+
+                # Find a free CID for this new channel
+                connection_channels = self.channels.setdefault(connection.handle, {})
+                source_cid = self.find_free_le_cid(connection_channels)
+                if source_cid is None:  # Should never happen!
+                    self.send_control_frame(
+                        connection,
+                        cid,
+                        L2CAP_LE_Credit_Based_Connection_Response(
+                            identifier=request.identifier,
+                            destination_cid=0,
+                            mtu=server.mtu,
+                            mps=server.mps,
+                            initial_credits=0,
+                            # pylint: disable=line-too-long
+                            result=L2CAP_LE_Credit_Based_Connection_Response.CONNECTION_REFUSED_NO_RESOURCES_AVAILABLE,
+                        ),
+                    )
+                    return
+
+                # Create a new channel
+                logger.debug(
+                    f'creating LE CoC server channel with cid={source_cid} for psm '
+                    f'{request.le_psm}'
+                )
+                channel = LeCreditBasedChannel(
+                    self,
+                    connection,
+                    request.le_psm,
+                    source_cid,
+                    request.source_cid,
+                    server.mtu,
+                    server.mps,
+                    request.initial_credits,
+                    request.mtu,
+                    request.mps,
+                    server.max_credits,
+                    True,
+                )
+                connection_channels[source_cid] = channel
+                le_connection_channels[request.source_cid] = channel
+
+                # Respond
+                self.send_control_frame(
+                    connection,
+                    cid,
+                    L2CAP_LE_Credit_Based_Connection_Response(
+                        identifier=request.identifier,
+                        destination_cid=source_cid,
+                        mtu=server.mtu,
+                        mps=server.mps,
+                        initial_credits=server.max_credits,
+                        # pylint: disable=line-too-long
+                        result=L2CAP_LE_Credit_Based_Connection_Response.CONNECTION_SUCCESSFUL,
+                    ),
+                )
+
+                # Notify
+                server.on_connection(channel)
+            else:
+                logger.info(
+                    f'No LE server for connection 0x{connection.handle:04X} '
+                    f'on PSM {request.le_psm}'
+                )
                 self.send_control_frame(
                     connection,
                     cid,
                     L2CAP_LE_Credit_Based_Connection_Response(
                         identifier=request.identifier,
                         destination_cid=0,
-                        mtu=server.mtu,
-                        mps=server.mps,
+                        mtu=L2CAP_LE_CREDIT_BASED_CONNECTION_DEFAULT_MTU,
+                        mps=L2CAP_LE_CREDIT_BASED_CONNECTION_DEFAULT_MPS,
                         initial_credits=0,
                         # pylint: disable=line-too-long
-                        result=L2CAP_LE_Credit_Based_Connection_Response.CONNECTION_REFUSED_SOURCE_CID_ALREADY_ALLOCATED,
+                        result=L2CAP_LE_Credit_Based_Connection_Response.CONNECTION_REFUSED_LE_PSM_NOT_SUPPORTED,
                     ),
                 )
-                return
 
-            # Find a free CID for this new channel
-            connection_channels = self.channels.setdefault(connection.handle, {})
-            source_cid = self.find_free_le_cid(connection_channels)
-            if source_cid is None:  # Should never happen!
-                self.send_control_frame(
-                    connection,
-                    cid,
-                    L2CAP_LE_Credit_Based_Connection_Response(
-                        identifier=request.identifier,
-                        destination_cid=0,
-                        mtu=server.mtu,
-                        mps=server.mps,
-                        initial_credits=0,
-                        # pylint: disable=line-too-long
-                        result=L2CAP_LE_Credit_Based_Connection_Response.CONNECTION_REFUSED_NO_RESOURCES_AVAILABLE,
-                    ),
-                )
-                return
-
-            # Create a new channel
-            logger.debug(
-                f'creating LE CoC server channel with cid={source_cid} for psm '
-                f'{request.le_psm}'
-            )
-            channel = LeCreditBasedChannel(
-                self,
-                connection,
-                request.le_psm,
-                source_cid,
-                request.source_cid,
-                server.mtu,
-                server.mps,
-                request.initial_credits,
-                request.mtu,
-                request.mps,
-                server.max_credits,
-                True,
-            )
-            connection_channels[source_cid] = channel
-            le_connection_channels[request.source_cid] = channel
-
-            # Respond
-            self.send_control_frame(
-                connection,
-                cid,
-                L2CAP_LE_Credit_Based_Connection_Response(
-                    identifier=request.identifier,
-                    destination_cid=source_cid,
-                    mtu=server.mtu,
-                    mps=server.mps,
-                    initial_credits=server.max_credits,
-                    # pylint: disable=line-too-long
-                    result=L2CAP_LE_Credit_Based_Connection_Response.CONNECTION_SUCCESSFUL,
-                ),
-            )
-
-            # Notify
-            server.on_connection(channel)
-        else:
-            logger.info(
-                f'No LE server for connection 0x{connection.handle:04X} '
-                f'on PSM {request.le_psm}'
-            )
-            self.send_control_frame(
-                connection,
-                cid,
-                L2CAP_LE_Credit_Based_Connection_Response(
-                    identifier=request.identifier,
-                    destination_cid=0,
-                    mtu=L2CAP_LE_CREDIT_BASED_CONNECTION_DEFAULT_MTU,
-                    mps=L2CAP_LE_CREDIT_BASED_CONNECTION_DEFAULT_MPS,
-                    initial_credits=0,
-                    # pylint: disable=line-too-long
-                    result=L2CAP_LE_Credit_Based_Connection_Response.CONNECTION_REFUSED_LE_PSM_NOT_SUPPORTED,
-                ),
-            )
+        # Spawn connection request handling.
+        connection.abort_on('disconnection', handle_connection_request())
 
     def on_l2cap_le_credit_based_connection_response(
         self, connection: Connection, _cid: int, response
