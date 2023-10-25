@@ -1480,7 +1480,7 @@ class IncomingConnection:
         """L2CAP incoming basic channel connection request."""
 
         def __post_init__(self) -> None:
-            super(IncomingConnection.Future, self).__init__()
+            super(IncomingConnection.Future, self).__init__()  # type: ignore[bad-super-call]
 
     @dataclasses.dataclass
     class LeCreditBased(Any, Future[PendingConnection.LeCreditBased]):
@@ -1491,7 +1491,7 @@ class IncomingConnection:
         initial_credits: int
 
         def __post_init__(self) -> None:
-            super(IncomingConnection.Future, self).__init__()
+            super(IncomingConnection.Future, self).__init__()  # type: ignore[bad-super-call]
 
 
 # -----------------------------------------------------------------------------
