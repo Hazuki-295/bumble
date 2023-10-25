@@ -17,7 +17,6 @@
 # -----------------------------------------------------------------------------
 from __future__ import annotations
 import asyncio
-import contextlib
 import dataclasses
 import enum
 import logging
@@ -26,19 +25,21 @@ import struct
 from collections import deque
 from pyee import EventEmitter
 from typing import (
-    Awaitable,
     Dict,
+    Set,
     Type,
     List,
     Optional,
     Tuple,
     Callable,
     Any,
+    TypeVar,
     Union,
     Deque,
     Iterable,
     SupportsBytes,
     TYPE_CHECKING,
+    overload,
 )
 
 from .utils import deprecated
@@ -1386,19 +1387,13 @@ class LeCreditBasedChannel(EventEmitter):
 
 
 # -----------------------------------------------------------------------------
+@dataclasses.dataclass
 class ClassicChannelServer(EventEmitter):
-    def __init__(
-        self,
-        manager: ChannelManager,
-        psm: int,
-        handler: Optional[Callable[[ClassicChannel], Any]],
-        mtu: int,
-    ) -> None:
+    _close_closure: Callable[[], None]
+    handler: Optional[Callable[[ClassicChannel], Any]]
+
+    def __post_init__(self) -> None:
         super().__init__()
-        self.manager = manager
-        self.handler = handler
-        self.psm = psm
-        self.mtu = mtu
 
     def on_connection(self, channel: ClassicChannel) -> None:
         self.emit('connection', channel)
@@ -1406,28 +1401,17 @@ class ClassicChannelServer(EventEmitter):
             self.handler(channel)
 
     def close(self) -> None:
-        if self.psm in self.manager.servers:
-            del self.manager.servers[self.psm]
+        self._close_closure()
 
 
 # -----------------------------------------------------------------------------
+@dataclasses.dataclass
 class LeCreditBasedChannelServer(EventEmitter):
-    def __init__(
-        self,
-        manager: ChannelManager,
-        psm: int,
-        handler: Optional[Callable[[LeCreditBasedChannel], Any]],
-        max_credits: int,
-        mtu: int,
-        mps: int,
-    ) -> None:
+    _close_closure: Callable[[], None]
+    handler: Optional[Callable[[LeCreditBasedChannel], Any]]
+
+    def __post_init__(self) -> None:
         super().__init__()
-        self.manager = manager
-        self.handler = handler
-        self.psm = psm
-        self.max_credits = max_credits
-        self.mtu = mtu
-        self.mps = mps
 
     def on_connection(self, channel: LeCreditBasedChannel) -> None:
         self.emit('connection', channel)
@@ -1435,8 +1419,79 @@ class LeCreditBasedChannelServer(EventEmitter):
             self.handler(channel)
 
     def close(self) -> None:
-        if self.psm in self.manager.le_coc_servers:
-            del self.manager.le_coc_servers[self.psm]
+        self._close_closure()
+
+
+# -----------------------------------------------------------------------------
+class PendingConnection:
+    class Any:
+        """L2CAP any channel pending connection."""
+
+        on_connection: Callable[[Any], None]
+        mtu: int
+
+    @dataclasses.dataclass
+    class Basic(Any):
+        """L2CAP basic channel pending connection."""
+
+        on_connection: Callable[[ClassicChannel], None] = lambda _: None
+        mtu: int = L2CAP_MIN_BR_EDR_MTU
+
+    @dataclasses.dataclass
+    class LeCreditBased(Any):
+        """L2CAP LE credit based channel pending connection."""
+
+        on_connection: Callable[[LeCreditBasedChannel], None] = lambda _: None
+        mtu: int = L2CAP_LE_CREDIT_BASED_CONNECTION_DEFAULT_MTU
+        mps: int = L2CAP_LE_CREDIT_BASED_CONNECTION_DEFAULT_MPS
+        max_credits: int = L2CAP_LE_CREDIT_BASED_CONNECTION_DEFAULT_INITIAL_CREDITS
+
+
+# -----------------------------------------------------------------------------
+TPendingConnection = TypeVar('TPendingConnection', bound=PendingConnection.Any)
+
+
+class IncomingConnection:
+    @dataclasses.dataclass
+    class Any:
+        """L2CAP any incoming channel connection request."""
+
+        connection: Connection
+        psm: int
+        source_cid: int
+
+        def expired(self) -> bool:
+            ...
+
+    class Future(asyncio.Future[TPendingConnection]):
+        def accept(self, pend: TPendingConnection) -> bool:
+            """Accept this connection request."""
+            try:
+                self.set_result(pend)
+                return True
+            except asyncio.InvalidStateError:
+                return False
+
+        def expired(self) -> bool:
+            return self.done() or self.cancelled()
+
+    @dataclasses.dataclass
+    class Basic(Any, Future[PendingConnection.Basic]):
+        """L2CAP incoming basic channel connection request."""
+
+        def __post_init__(self) -> None:
+            super(IncomingConnection.Future, self).__init__()
+
+    @dataclasses.dataclass
+    class LeCreditBased(Any, Future[PendingConnection.LeCreditBased]):
+        """L2CAP incoming LE credit based channel connection request."""
+
+        mtu: int
+        mps: int
+        initial_credits: int
+
+        def __post_init__(self) -> None:
+            super(IncomingConnection.Future, self).__init__()
 
 
 # -----------------------------------------------------------------------------
@@ -1444,21 +1499,15 @@ class ChannelManager:
     identifiers: Dict[int, int]
     channels: Dict[int, Dict[int, Union[ClassicChannel, LeCreditBasedChannel]]]
     servers: Dict[int, ClassicChannelServer]
-    server_fallback: Optional[
-        Callable[[L2CAP_Connection_Request], Awaitable[ClassicChannelServer]]
-    ]
     le_coc_channels: Dict[int, Dict[int, LeCreditBasedChannel]]
     le_coc_servers: Dict[int, LeCreditBasedChannelServer]
     le_coc_requests: Dict[int, L2CAP_LE_Credit_Based_Connection_Request]
-    le_coc_server_fallback: Optional[
-        Callable[
-            [L2CAP_LE_Credit_Based_Connection_Request],
-            Awaitable[LeCreditBasedChannelServer],
-        ]
-    ]
     fixed_channels: Dict[int, Optional[Callable[[int, bytes], Any]]]
     _host: Optional[Host]
     connection_parameters_update_response: Optional[asyncio.Future[int]]
+
+    listeners: List[Callable[[IncomingConnection.Any], None]] = []
+    used_psm: Set[int] = set()
 
     def __init__(
         self,
@@ -1473,16 +1522,19 @@ class ChannelManager:
             L2CAP_LE_SIGNALING_CID: None,
         }
         self.servers = {}  # Servers accepting connections, by PSM
-        self.server_fallback = None
         self.le_coc_channels = (
             {}
         )  # LE CoC channels, mapped by connection and destination cid
         self.le_coc_servers = {}  # LE CoC - Servers accepting connections, by PSM
         self.le_coc_requests = {}  # LE CoC connection requests, by identifier
-        self.le_coc_server_fallback = None
         self.extended_features = extended_features
         self.connectionless_mtu = connectionless_mtu
         self.connection_parameters_update_response = None
+        self.accepts = []
+        self.le_credit_based_accepts = []
+
+        self.listeners = []
+        self.used_psm = set()
 
     @property
     def host(self) -> Host:
@@ -1535,6 +1587,31 @@ class ChannelManager:
 
         raise RuntimeError('no free CID')
 
+    def allocate_psm(self) -> int:
+        # Find a free PSM
+        for candidate in range(
+            L2CAP_PSM_DYNAMIC_RANGE_START, L2CAP_PSM_DYNAMIC_RANGE_END + 1, 2
+        ):
+            if (candidate >> 8) % 2 == 1:
+                continue
+            if candidate in self.used_psm:
+                continue
+            return candidate
+        raise InvalidStateError('no free PSM')
+
+    def allocate_spsm(self) -> int:
+        # Find a free sPSM
+        for candidate in range(
+            L2CAP_LE_PSM_DYNAMIC_RANGE_START, L2CAP_LE_PSM_DYNAMIC_RANGE_END + 1
+        ):
+            if candidate in self.used_psm:
+                continue
+            return candidate
+        raise InvalidStateError('no free PSM')
+
+    def free_psm(self, psm: int) -> None:
+        self.used_psm.remove(psm)
+
     def next_identifier(self, connection: Connection) -> int:
         identifier = (self.identifiers.setdefault(connection.handle, 0) + 1) % 256
         self.identifiers[connection.handle] = identifier
@@ -1549,51 +1626,73 @@ class ChannelManager:
         if cid in self.fixed_channels:
             del self.fixed_channels[cid]
 
+    @overload
+    def listen(
+        self, cb: Callable[[IncomingConnection.Basic], None]
+    ) -> Callable[[IncomingConnection.Basic], None]:
+        ...
+
+    @overload
+    def listen(
+        self, cb: Callable[[IncomingConnection.LeCreditBased], None]
+    ) -> Callable[[IncomingConnection.LeCreditBased], None]:
+        ...
+
+    def listen(self, cb: Any) -> Any:
+        if cb in self.listeners:
+            raise ValueError('listener already registered')
+        self.listeners.append(cb)
+        return cb
+
+    @overload
+    def unlisten(self, cb: Callable[[IncomingConnection.Basic], None]) -> None:
+        ...
+
+    @overload
+    def unlisten(self, cb: Callable[[IncomingConnection.LeCreditBased], None]) -> None:
+        ...
+
+    def unlisten(self, cb: Any) -> None:
+        self.listeners.remove(cb)
+
     @deprecated("Please use create_classic_server")
     def register_server(
         self,
         psm: int,
         server: Callable[[ClassicChannel], Any],
     ) -> int:
-        return self.create_classic_server(
-            handler=server, spec=ClassicChannelSpec(psm=psm)
-        ).psm
+        self.create_classic_server(handler=server, spec=ClassicChannelSpec(psm=psm))
+        return psm
 
     def create_classic_server(
         self,
         spec: ClassicChannelSpec,
         handler: Optional[Callable[[ClassicChannel], Any]] = None,
     ) -> ClassicChannelServer:
-        if not spec.psm:
-            # Find a free PSM
-            for candidate in range(
-                L2CAP_PSM_DYNAMIC_RANGE_START, L2CAP_PSM_DYNAMIC_RANGE_END + 1, 2
-            ):
-                if (candidate >> 8) % 2 == 1:
-                    continue
-                if candidate in self.servers:
-                    continue
-                spec.psm = candidate
-                break
-            else:
-                raise InvalidStateError('no free PSM')
+        server: ClassicChannelServer
+        if (psm := spec.psm) is None:
+            psm = self.allocate_psm()
         else:
-            # Check that the PSM isn't already in use
-            if spec.psm in self.servers:
-                raise ValueError('PSM already in use')
-
             # Check that the PSM is valid
-            if spec.psm % 2 == 0:
+            if psm % 2 == 0:
                 raise ValueError('invalid PSM (not odd)')
-            check = spec.psm >> 8
+            check = psm >> 8
             while check:
                 if check % 2 != 0:
                     raise ValueError('invalid PSM')
                 check >>= 8
 
-        self.servers[spec.psm] = ClassicChannelServer(self, spec.psm, handler, spec.mtu)
+        def listener(incoming: IncomingConnection.Basic) -> None:
+            if incoming.psm == spec.psm:
+                incoming.accept(PendingConnection.Basic(server.on_connection, spec.mtu))
 
-        return self.servers[spec.psm]
+        def close() -> None:
+            self.unlisten(listener)
+            if spec.psm is None:
+                self.free_psm(psm)
+
+        server = ClassicChannelServer(close, handler)
+        return server
 
     @deprecated("Please use create_le_credit_based_server()")
     def register_le_coc_server(
@@ -1604,44 +1703,37 @@ class ChannelManager:
         mtu: int,
         mps: int,
     ) -> int:
-        return self.create_le_credit_based_server(
+        self.create_le_credit_based_server(
             spec=LeCreditBasedChannelSpec(
                 psm=None if psm == 0 else psm, mtu=mtu, mps=mps, max_credits=max_credits
             ),
             handler=server,
-        ).psm
+        )
+        return psm
 
     def create_le_credit_based_server(
         self,
         spec: LeCreditBasedChannelSpec,
         handler: Optional[Callable[[LeCreditBasedChannel], Any]] = None,
     ) -> LeCreditBasedChannelServer:
-        if not spec.psm:
-            # Find a free PSM
-            for candidate in range(
-                L2CAP_LE_PSM_DYNAMIC_RANGE_START, L2CAP_LE_PSM_DYNAMIC_RANGE_END + 1
-            ):
-                if candidate in self.le_coc_servers:
-                    continue
-                spec.psm = candidate
-                break
-            else:
-                raise InvalidStateError('no free PSM')
-        else:
-            # Check that the PSM isn't already in use
-            if spec.psm in self.le_coc_servers:
-                raise ValueError('PSM already in use')
+        server: LeCreditBasedChannelServer
+        spsm = spec.psm or self.allocate_spsm()
 
-        self.le_coc_servers[spec.psm] = LeCreditBasedChannelServer(
-            self,
-            spec.psm,
-            handler,
-            max_credits=spec.max_credits,
-            mtu=spec.mtu,
-            mps=spec.mps,
-        )
+        def listener(incoming: IncomingConnection.LeCreditBased) -> None:
+            if incoming.psm == spec.psm:
+                incoming.accept(
+                    PendingConnection.LeCreditBased(
+                        server.on_connection, spec.mtu, spec.mps, spec.max_credits
+                    )
+                )
 
-        return self.le_coc_servers[spec.psm]
+        def close() -> None:
+            self.unlisten(listener)
+            if spec.psm is None:
+                self.free_psm(spsm)
+
+        server = LeCreditBasedChannelServer(close, handler)
+        return server
 
     def on_disconnection(self, connection_handle: int, _reason: int) -> None:
         logger.debug(f'disconnection from {connection_handle}, cleaning up channels')
@@ -1746,15 +1838,22 @@ class ChannelManager:
 
         # Asynchronous connection request handling.
         async def handle_connection_request() -> None:
-            # Check if there's a server for this PSM
-            server = self.servers.get(request.psm)
+            incoming = IncomingConnection.Basic(
+                connection, request.psm, request.source_cid
+            )
 
-            # Attempt to get a fallback server within a timeout.
-            if server is None and self.server_fallback is not None:
-                with contextlib.suppress(asyncio.TimeoutError):
-                    server = await asyncio.wait_for(self.server_fallback(request), 3.0)
+            # Dispatch incoming connection.
+            for listener in self.listeners:
+                if not incoming.done():
+                    listener(incoming)
 
-            if server:
+            try:
+                pending = await asyncio.wait_for(incoming, timeout=3.0)
+            except asyncio.TimeoutError as e:
+                incoming.cancel(e)
+                pending = None
+
+            if pending:
                 # Find a free CID for this new channel
                 connection_channels = self.channels.setdefault(connection.handle, {})
                 source_cid = self.find_free_br_edr_cid(connection_channels)
@@ -1778,12 +1877,12 @@ class ChannelManager:
                     f'creating server channel with cid={source_cid} for psm {request.psm}'
                 )
                 channel = ClassicChannel(
-                    self, connection, cid, request.psm, source_cid, server.mtu
+                    self, connection, cid, request.psm, source_cid, pending.mtu
                 )
                 connection_channels[source_cid] = channel
 
                 # Notify
-                server.on_connection(channel)
+                pending.on_connection(channel)
                 channel.on_connection_request(request)
             else:
                 logger.warning(
@@ -2013,17 +2112,27 @@ class ChannelManager:
 
         # Asynchronous connection request handling.
         async def handle_connection_request() -> None:
-            # Check if there's a server for this LE PSM
-            server = self.servers.get(request.le_psm)
+            incoming = IncomingConnection.LeCreditBased(
+                connection,
+                request.le_psm,
+                request.source_cid,
+                request.mtu,
+                request.mps,
+                request.initial_credits,
+            )
 
-            # Attempt to get a fallback server within a timeout.
-            if server is None and self.le_coc_server_fallback is not None:
-                with contextlib.suppress(asyncio.TimeoutError):
-                    server = await asyncio.wait_for(
-                        self.le_coc_server_fallback(request), 3.0
-                    )
+            # Dispatch incoming connection.
+            for listener in self.listeners:
+                if not incoming.done():
+                    listener(incoming)
 
-            if server:
+            try:
+                pending = await asyncio.wait_for(incoming, timeout=3.0)
+            except asyncio.TimeoutError as e:
+                incoming.cancel(e)
+                pending = None
+
+            if pending:
                 # Check that the CID isn't already used
                 le_connection_channels = self.le_coc_channels.setdefault(
                     connection.handle, {}
@@ -2036,8 +2145,8 @@ class ChannelManager:
                         L2CAP_LE_Credit_Based_Connection_Response(
                             identifier=request.identifier,
                             destination_cid=0,
-                            mtu=server.mtu,
-                            mps=server.mps,
+                            mtu=pending.mtu,
+                            mps=pending.mps,
                             initial_credits=0,
                             # pylint: disable=line-too-long
                             result=L2CAP_LE_Credit_Based_Connection_Response.CONNECTION_REFUSED_SOURCE_CID_ALREADY_ALLOCATED,
@@ -2055,8 +2164,8 @@ class ChannelManager:
                         L2CAP_LE_Credit_Based_Connection_Response(
                             identifier=request.identifier,
                             destination_cid=0,
-                            mtu=server.mtu,
-                            mps=server.mps,
+                            mtu=pending.mtu,
+                            mps=pending.mps,
                             initial_credits=0,
                             # pylint: disable=line-too-long
                             result=L2CAP_LE_Credit_Based_Connection_Response.CONNECTION_REFUSED_NO_RESOURCES_AVAILABLE,
@@ -2075,12 +2184,12 @@ class ChannelManager:
                     request.le_psm,
                     source_cid,
                     request.source_cid,
-                    server.mtu,
-                    server.mps,
+                    pending.mtu,
+                    pending.mps,
                     request.initial_credits,
                     request.mtu,
                     request.mps,
-                    server.max_credits,
+                    pending.max_credits,
                     True,
                 )
                 connection_channels[source_cid] = channel
@@ -2093,16 +2202,16 @@ class ChannelManager:
                     L2CAP_LE_Credit_Based_Connection_Response(
                         identifier=request.identifier,
                         destination_cid=source_cid,
-                        mtu=server.mtu,
-                        mps=server.mps,
-                        initial_credits=server.max_credits,
+                        mtu=pending.mtu,
+                        mps=pending.mps,
+                        initial_credits=pending.max_credits,
                         # pylint: disable=line-too-long
                         result=L2CAP_LE_Credit_Based_Connection_Response.CONNECTION_SUCCESSFUL,
                     ),
                 )
 
                 # Notify
-                server.on_connection(channel)
+                pending.on_connection(channel)
             else:
                 logger.info(
                     f'No LE server for connection 0x{connection.handle:04X} '
