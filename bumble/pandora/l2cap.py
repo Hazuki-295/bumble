@@ -113,6 +113,7 @@ class ChannelIndex:
     def __hash__(self):
         return hash(self.connection_handle | (self.cid << 12))
 
+
 class L2CAPService(l2cap_grpc_aio.L2CAPServicer):
     channels: Dict[ChannelIndex, ChannelProxy] = {}
     pending: List[l2cap.IncomingConnection.Any] = []
